@@ -17,6 +17,8 @@ build/
 /.tmp/
 /results/
 /data/
+/voice_library/*.pt
+/voice_library/*.json
 /download
 /local/
 /run*

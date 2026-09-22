@@ -331,10 +331,9 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             "</span>"
                         )
                         vc_ref_text = gr.Textbox(
-                            label=("Reference Text (optional) / 参考音频文本（可选）"),
+                            label=("Văn bản mẫu / Reference Text (Bắt buộc / Required)"),
                             lines=2,
-                            placeholder="Transcript of the reference audio. Leave empty"
-                            " to auto-transcribe via ASR models.",
+                            placeholder="Vui lòng nhập transcript của file mẫu để tránh lỗi sinh audio. / Please enter the transcript to avoid hallucination.",
                         )
                         vc_lang = _lang_dropdown("Language (optional) / 语种 (可选)")
                         with gr.Accordion("Instruct (optional)", open=False):
@@ -359,6 +358,8 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                 def _clone_fn(
                     text, lang, ref_aud, ref_text, instruct, ns, gs, dn, sp, du, pp, po
                 ):
+                    if not ref_text or not ref_text.strip():
+                        return None, "Lỗi: Văn bản mẫu (Reference Text) là bắt buộc. Vui lòng nhập nội dung của file âm thanh mẫu."
                     return _gen(
                         text,
                         lang,
@@ -372,7 +373,7 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         pp,
                         po,
                         mode="clone",
-                        ref_text=ref_text or None,
+                        ref_text=ref_text.strip(),
                     )
 
                 vc_btn.click(
