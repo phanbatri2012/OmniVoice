@@ -57,6 +57,11 @@ if not INTERNAL_TOKEN:
         TOKEN_PATH.write_text(INTERNAL_TOKEN, encoding="utf-8")
     except Exception:
         pass
+else:
+    try:
+        TOKEN_PATH.write_text(INTERNAL_TOKEN, encoding="utf-8")
+    except Exception:
+        pass
 IDLE_UNLOAD_SECONDS = max(
     60, int(os.environ.get("OMNIVOICE_IDLE_UNLOAD_SECONDS", "900"))
 )
