@@ -43,7 +43,20 @@ PROFILE_DIR = ROOT_DIR / "voice_library"
 PROFILE_CATALOG_PATH = DATA_DIR / "profile_catalog.json"
 LEGACY_SAMPLE_DIR = ROOT_DIR / "voice"
 MODEL_ID = os.environ.get("OMNIVOICE_MODEL_ID", "k2-fsa/OmniVoice")
+TOKEN_PATH = DATA_DIR / "omnivoice_internal_token.txt"
 INTERNAL_TOKEN = os.environ.get("AUTO_YT_OMNIVOICE_TOKEN", "").strip()
+if not INTERNAL_TOKEN:
+    if TOKEN_PATH.exists():
+        try:
+            INTERNAL_TOKEN = TOKEN_PATH.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+if not INTERNAL_TOKEN:
+    INTERNAL_TOKEN = secrets.token_urlsafe(48)
+    try:
+        TOKEN_PATH.write_text(INTERNAL_TOKEN, encoding="utf-8")
+    except Exception:
+        pass
 IDLE_UNLOAD_SECONDS = max(
     60, int(os.environ.get("OMNIVOICE_IDLE_UNLOAD_SECONDS", "900"))
 )
@@ -289,7 +302,7 @@ def _validate_generated_audio(
     if word_count:
         minimum_wpm = float(settings.get("min_words_per_minute", DEFAULT_MIN_WORDS_PER_MINUTE))
         maximum_wpm = float(settings.get("max_words_per_minute", DEFAULT_MAX_WORDS_PER_MINUTE))
-        minimum_duration = max(1.0, word_count * 60.0 / maximum_wpm - 2.0)
+        minimum_duration = max(0.2, min(1.0, word_count * 0.2), word_count * 60.0 / maximum_wpm - 2.0)
         maximum_duration = max(
             8.0,
             word_count * 60.0 / minimum_wpm + extra_allowance_seconds,
@@ -583,7 +596,7 @@ def _recover_jobs() -> None:
     for manifest_path in JOBS_DIR.glob("*/manifest.json"):
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if manifest.get("status") in {"queued", "processing"}:
+            if manifest.get("status") in {"queued", "processing", "failed"}:
                 manifest["status"] = "queued"
                 manifest["error"] = ""
                 _atomic_json(manifest_path, manifest)
