@@ -78,9 +78,22 @@ class OmniVoiceWorkerTests(unittest.TestCase):
                 settings,
             )
 
+    def test_quality_gate_accepts_short_dialogue_phrase(self):
+        settings = api_server._normalize_new_job_settings({})
+        # 4 words generated in 0.55s at 24kHz
+        audio = np.ones(int(24_000 * 0.55), dtype=np.float32) * 0.05
+        duration = api_server._validate_generated_audio(
+            audio,
+            24_000,
+            "Toàn bộ mảnh đất?",
+            settings,
+        )
+        self.assertAlmostEqual(duration, 0.55, places=2)
+
     def test_legacy_manifest_does_not_enable_new_quality_policy(self):
         self.assertFalse(api_server._is_quality_managed({"pause_ms": 250}))
 
 
 if __name__ == "__main__":
     unittest.main()
+

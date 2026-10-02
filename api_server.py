@@ -90,13 +90,31 @@ def _process_marker_is_alive(path: Path) -> bool:
         return False
 
 
+_FILE_LOCK = threading.RLock()
+
+
 def _atomic_json(path: Path, payload: dict) -> None:
+    content = json.dumps(payload, ensure_ascii=False, indent=2)
     temporary = path.with_suffix(f"{path.suffix}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    with _FILE_LOCK:
+        temporary.write_text(content, encoding="utf-8")
+        last_error: Exception | None = None
+        for attempt in range(10):
+            try:
+                os.replace(temporary, path)
+                return
+            except OSError as exc:
+                last_error = exc
+                time.sleep(0.05 * (attempt + 1))
+        # Fallback if os.replace fails repeatedly on Windows due to transient file locks
+        try:
+            path.write_text(content, encoding="utf-8")
+            temporary.unlink(missing_ok=True)
+            return
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            if last_error:
+                raise last_error
 
 
 def _safe_job_dir(job_id: str) -> Path:
@@ -126,12 +144,19 @@ def _profile_path(profile_id: str) -> Path:
 def _load_profile_catalog() -> dict[str, dict]:
     if not PROFILE_CATALOG_PATH.exists():
         return {}
-    try:
-        payload = json.loads(PROFILE_CATALOG_PATH.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        LOGGER.warning("OmniVoice profile catalog is unreadable; rebuilding names lazily.")
-        return {}
+    with _FILE_LOCK:
+        for attempt in range(5):
+            try:
+                content = PROFILE_CATALOG_PATH.read_text(encoding="utf-8")
+                if not content.strip():
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                payload = json.loads(content)
+                return payload if isinstance(payload, dict) else {}
+            except (OSError, json.JSONDecodeError):
+                time.sleep(0.05 * (attempt + 1))
+    LOGGER.warning("OmniVoice profile catalog is unreadable; rebuilding names lazily.")
+    return {}
 
 
 def _save_profile_catalog(catalog: dict[str, dict]) -> None:
@@ -147,30 +172,31 @@ def _canonicalize_legacy_profiles(catalog: dict) -> list[dict]:
     The original profile remains untouched for OmniVoice's existing UI.
     """
     profiles: list[dict] = []
-    for original_path in sorted(PROFILE_DIR.glob("*.pt")):
-        if PROFILE_ID_PATTERN.fullmatch(original_path.stem):
-            continue
-        profile_id = str(
-            uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                f"omnivoice-profile:{original_path.resolve()}",
+    with _FILE_LOCK:
+        for original_path in sorted(PROFILE_DIR.glob("*.pt")):
+            if PROFILE_ID_PATTERN.fullmatch(original_path.stem):
+                continue
+            profile_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"omnivoice-profile:{original_path.resolve()}",
+                )
             )
-        )
-        canonical_path = _profile_path(profile_id)
-        if not canonical_path.exists():
-            shutil.copy2(original_path, canonical_path)
-            
-        metadata = catalog.get(profile_id) or {}
-        profiles.append(
-            {
-                "id": profile_id,
-                "name": original_path.stem,
-                "status": "active",
-                "kind": "profile",
-                "legacy_source": True,
-                "settings": metadata.get("settings", {}),
-            }
-        )
+            canonical_path = _profile_path(profile_id)
+            if not canonical_path.exists():
+                shutil.copy2(original_path, canonical_path)
+                
+            metadata = catalog.get(profile_id) or {}
+            profiles.append(
+                {
+                    "id": profile_id,
+                    "name": original_path.stem,
+                    "status": "active",
+                    "kind": "profile",
+                    "legacy_source": True,
+                    "settings": metadata.get("settings", {}),
+                }
+            )
     return profiles
 
 
@@ -178,10 +204,19 @@ def _read_manifest(job_dir: Path) -> dict:
     manifest_path = job_dir / "manifest.json"
     if not manifest_path.exists():
         raise HTTPException(status_code=404, detail="Không tìm thấy job OmniVoice.")
-    try:
-        return json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=500, detail="Manifest OmniVoice bị hỏng.") from exc
+    last_error: Exception | None = None
+    for attempt in range(10):
+        try:
+            with _FILE_LOCK:
+                content = manifest_path.read_text(encoding="utf-8")
+            if not content.strip():
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            return json.loads(content)
+        except (OSError, json.JSONDecodeError) as exc:
+            last_error = exc
+            time.sleep(0.05 * (attempt + 1))
+    raise HTTPException(status_code=500, detail="Manifest OmniVoice bị hỏng.") from last_error
 
 
 def _split_text(text: str, max_chars: int = DEFAULT_MAX_CHUNK_CHARS) -> list[str]:
@@ -307,7 +342,11 @@ def _validate_generated_audio(
     if word_count:
         minimum_wpm = float(settings.get("min_words_per_minute", DEFAULT_MIN_WORDS_PER_MINUTE))
         maximum_wpm = float(settings.get("max_words_per_minute", DEFAULT_MAX_WORDS_PER_MINUTE))
-        minimum_duration = max(0.2, min(1.0, word_count * 0.2), word_count * 60.0 / maximum_wpm - 2.0)
+        minimum_duration = max(
+            0.15,
+            min(0.8, word_count * 0.1),
+            word_count * 60.0 / maximum_wpm - 2.0,
+        )
         maximum_duration = max(
             8.0,
             word_count * 60.0 / minimum_wpm + extra_allowance_seconds,
@@ -600,7 +639,8 @@ def _idle_loop() -> None:
 def _recover_jobs() -> None:
     for manifest_path in JOBS_DIR.glob("*/manifest.json"):
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            with _FILE_LOCK:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             if manifest.get("status") in {"queued", "processing", "failed"}:
                 manifest["status"] = "queued"
                 manifest["error"] = ""
@@ -843,7 +883,8 @@ def create_job(request: TTSJobRequest) -> dict:
         raise HTTPException(status_code=400, detail="Profile giọng OmniVoice không tồn tại.")
     for manifest_path in JOBS_DIR.glob("*/manifest.json"):
         try:
-            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+            with _FILE_LOCK:
+                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
             if existing.get("request_hash") == request.request_hash:
                 if existing.get("status") in {"queued", "processing"}:
                     _queue_job(existing["id"])
