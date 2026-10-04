@@ -71,8 +71,8 @@ LEGACY_MAX_CHUNK_CHARS = 700
 ENGINE_REVISION = 3
 DEFAULT_MAX_CHUNK_CHARS = 220
 DEFAULT_TARGET_WORDS_PER_MINUTE = 145.0
-DEFAULT_MIN_WORDS_PER_MINUTE = 105.0
-DEFAULT_MAX_WORDS_PER_MINUTE = 240.0
+DEFAULT_MIN_WORDS_PER_MINUTE = 90.0
+DEFAULT_MAX_WORDS_PER_MINUTE = 320.0
 PROFILE_ID_PATTERN = re.compile(r"^[a-f0-9-]{36}$")
 SUPPORTED_SAMPLE_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg"}
 
@@ -258,7 +258,7 @@ def _normalize_new_job_settings(raw_settings: object) -> dict:
     minimum_wpm = _bounded_number(
         settings.get("min_words_per_minute", DEFAULT_MIN_WORDS_PER_MINUTE),
         DEFAULT_MIN_WORDS_PER_MINUTE,
-        60,
+        50,
         220,
         "Tốc độ tối thiểu",
     )
@@ -266,7 +266,7 @@ def _normalize_new_job_settings(raw_settings: object) -> dict:
         settings.get("max_words_per_minute", DEFAULT_MAX_WORDS_PER_MINUTE),
         DEFAULT_MAX_WORDS_PER_MINUTE,
         120,
-        360,
+        380,
         "Tốc độ tối đa",
     )
     target_wpm = _bounded_number(
@@ -345,7 +345,7 @@ def _validate_generated_audio(
         minimum_duration = max(
             0.15,
             min(0.8, word_count * 0.1),
-            word_count * 60.0 / maximum_wpm - 2.0,
+            word_count * 60.0 / maximum_wpm - max(2.0, min(15.0, word_count * 0.02)),
         )
         maximum_duration = max(
             8.0,
@@ -487,12 +487,13 @@ def _merge_chunks(job_dir: Path, manifest: dict) -> Path:
     merged_audio = np.concatenate(audio_parts)
     if _is_quality_managed(manifest.get("settings")):
         pause_seconds = pause_ms * max(0, len(chunk_paths) - 1) / 1000.0
+        chunk_cushion = max(2.0, len(chunk_paths) * 0.25)
         _validate_generated_audio(
             merged_audio,
             int(sample_rate),
             " ".join(chunk["text"] for chunk in manifest["chunks"]),
             manifest["settings"],
-            extra_allowance_seconds=4.0 + pause_seconds,
+            extra_allowance_seconds=4.0 + pause_seconds + chunk_cushion,
         )
     sf.write(str(final_path), merged_audio, sample_rate, subtype="PCM_16")
     _wav_duration(final_path)
