@@ -601,10 +601,42 @@ def _process_job(job_id: str) -> None:
             manifest["status"] = "completed"
             manifest["audio_file"] = final_path.name
             manifest["duration_seconds"] = _wav_duration(final_path)
+            # Auto-cleanup temporary chunk files once final audio is successfully merged
+            _cleanup_job_chunks(job_dir, manifest)
         manifest["updated_at"] = time.time()
         _atomic_json(job_dir / "manifest.json", manifest)
     finally:
         RUNTIME.release()
+
+
+def _cleanup_job_chunks(job_dir: Path, manifest: dict[str, Any]) -> None:
+    """Removes intermediate WAV chunks to avoid unbounded disk usage."""
+    for chunk in manifest.get("chunks", []):
+        file_name = chunk.get("file")
+        if file_name:
+            chunk_path = job_dir / file_name
+            try:
+                chunk_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+    for tmp_file in job_dir.glob("*.tmp"):
+        try:
+            tmp_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _cleanup_expired_jobs(max_age_seconds: float = 86400.0) -> None:
+    """Purges completed, failed, or canceled job directories older than max_age_seconds."""
+    now = time.time()
+    for manifest_path in JOBS_DIR.glob("*/manifest.json"):
+        try:
+            mtime = manifest_path.stat().st_mtime
+            if now - mtime > max_age_seconds:
+                job_dir = manifest_path.parent
+                shutil.rmtree(job_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def _worker_loop() -> None:
@@ -633,8 +665,17 @@ def _worker_loop() -> None:
 
 
 def _idle_loop() -> None:
+    last_cleanup = 0.0
     while not STOP_EVENT.wait(30):
         RUNTIME.unload_if_idle()
+        # Periodically purge jobs older than 24h every 15 minutes
+        now = time.time()
+        if now - last_cleanup > 900:
+            last_cleanup = now
+            try:
+                _cleanup_expired_jobs(max_age_seconds=86400.0)
+            except Exception:
+                pass
 
 
 def _recover_jobs() -> None:
