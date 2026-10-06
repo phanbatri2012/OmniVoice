@@ -29,4 +29,7 @@ examples/download*
 examples/exp*
 .claude/
 *.wav
+*.WAV
+*.mp3
+*.MP3
 *.jsonl
