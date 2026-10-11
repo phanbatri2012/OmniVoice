@@ -17,8 +17,8 @@ build/
 /.tmp/
 /results/
 /data/
-/voice_library/*.pt
-/voice_library/*.json
+# /voice_library/*.pt
+# /voice_library/*.json
 /download
 /local/
 /run*
@@ -33,3 +33,7 @@ examples/exp*
 *.mp3
 *.MP3
 *.jsonl
+
+# Track voice assets & voice library
+!/voice/**
+!/voice_library/**

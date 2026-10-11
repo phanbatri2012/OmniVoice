@@ -1,5 +1,10 @@
 # OmniVoice API & Script Guidelines
 
+## Communication & Action Transparency
+- **Action Transparency & Purpose**: Before executing any tool call, file inspection, or command, output 1 concise line in Vietnamese stating clearly WHAT is being done and WHY/FOR WHAT PURPOSE (e.g. "Đang đọc file X... để kiểm tra cấu hình Y", "Đang chạy lệnh Z... nhằm xác định trạng thái tiến trình").
+- Communicate with the user concisely in Vietnamese. Use English for code identifiers, comments, and technical artifacts.
+
+## Generation Guidelines
 When working with OmniVoice generation (both in Python scripts and `api_server.py`) in this project, **always adhere to the following configurations** to ensure high-quality, hallucination-free Vietnamese TTS:
 
 1. **Ref Text is Mandatory for Voice Cloning**:
