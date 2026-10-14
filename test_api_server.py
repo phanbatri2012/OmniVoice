@@ -1,4 +1,6 @@
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,6 +12,38 @@ import api_server
 
 
 class OmniVoiceWorkerTests(unittest.TestCase):
+    def test_runtime_status_does_not_block_while_model_is_loading(self):
+        runtime = api_server.ModelRuntime()
+        load_started = threading.Event()
+        allow_load_to_finish = threading.Event()
+        model = object()
+
+        def slow_load(*_args, **_kwargs):
+            load_started.set()
+            self.assertTrue(allow_load_to_finish.wait(timeout=5))
+            return model
+
+        with (
+            patch.object(api_server, "_process_marker_is_alive", return_value=False),
+            patch.object(api_server.OmniVoice, "from_pretrained", side_effect=slow_load),
+        ):
+            loader = threading.Thread(target=runtime.acquire)
+            loader.start()
+            self.assertTrue(load_started.wait(timeout=2))
+
+            started_at = time.monotonic()
+            status = runtime.status()
+            elapsed = time.monotonic() - started_at
+
+            allow_load_to_finish.set()
+            loader.join(timeout=5)
+
+        self.assertFalse(loader.is_alive())
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(status["state"], "loading")
+        self.assertTrue(status["busy"])
+        self.assertFalse(status["model_loaded"])
+
     def test_natural_chunking_is_bounded_and_lossless(self):
         source = ("Một câu kể chuyện có dấu câu. " * 80).strip()
         chunks = api_server._split_text(source, max_chars=120)
@@ -96,4 +130,3 @@ class OmniVoiceWorkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

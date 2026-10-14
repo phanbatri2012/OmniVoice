@@ -375,10 +375,25 @@ class ModelRuntime:
     def __init__(self) -> None:
         self._model: OmniVoice | None = None
         self._lock = threading.RLock()
+        self._status_lock = threading.Lock()
         self._last_used = 0.0
         self._busy = False
         self._state = "sleeping"
         self._error = ""
+        self._status_snapshot = self._build_status_snapshot()
+
+    def _build_status_snapshot(self) -> dict:
+        return {
+            "state": self._state,
+            "model_loaded": self._model is not None,
+            "busy": self._busy,
+            "error": self._error,
+            "idle_unload_seconds": IDLE_UNLOAD_SECONDS,
+        }
+
+    def _refresh_status_snapshot(self) -> None:
+        with self._status_lock:
+            self._status_snapshot = self._build_status_snapshot()
 
     def acquire(self) -> OmniVoice:
         with self._lock:
@@ -391,6 +406,7 @@ class ModelRuntime:
             self._error = ""
             if self._model is None:
                 self._state = "loading"
+                self._refresh_status_snapshot()
                 try:
                     self._model = OmniVoice.from_pretrained(
                         MODEL_ID,
@@ -401,9 +417,11 @@ class ModelRuntime:
                     self._busy = False
                     self._state = "error"
                     self._error = str(exc)
+                    self._refresh_status_snapshot()
                     raise
             self._state = "busy"
             self._last_used = time.monotonic()
+            self._refresh_status_snapshot()
             return self._model
 
     def release(self) -> None:
@@ -411,6 +429,7 @@ class ModelRuntime:
             self._busy = False
             self._last_used = time.monotonic()
             self._state = "ready"
+            self._refresh_status_snapshot()
 
     def unload_if_idle(self) -> bool:
         with self._lock:
@@ -420,6 +439,7 @@ class ModelRuntime:
                 return False
             self._model = None
             self._state = "sleeping"
+            self._refresh_status_snapshot()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -428,14 +448,12 @@ class ModelRuntime:
         return True
 
     def status(self) -> dict:
-        with self._lock:
-            return {
-                "state": self._state,
-                "model_loaded": self._model is not None,
-                "busy": self._busy,
-                "error": self._error,
-                "idle_unload_seconds": IDLE_UNLOAD_SECONDS,
-            }
+        # Loading the model can take tens of seconds while holding ``_lock``.
+        # Health probes must remain responsive during that work; otherwise a
+        # caller can mistake a healthy worker for a stopped process and launch
+        # a second server on the same port.
+        with self._status_lock:
+            return dict(self._status_snapshot)
 
 
 RUNTIME = ModelRuntime()
