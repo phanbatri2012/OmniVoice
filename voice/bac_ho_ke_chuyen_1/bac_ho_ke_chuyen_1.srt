@@ -1,0 +1,20 @@
+1
+00:00:00,000 --> 00:00:03,333
+một ông khách ngồi cùng bàn mua một vé cơm xá xíu
+
+2
+00:00:03,800 --> 00:00:07,366
+một lúc sau thì chị phục vụ mang Ra 4 đĩa cơm thịt bò
+
+3
+00:00:07,966 --> 00:00:09,466
+thì anh bạn tôi liền hỏi
+
+4
+00:00:10,066 --> 00:00:11,933
+chúng tôi mua cơm xuất vang cơ mà
+
+5
+00:00:12,300 --> 00:00:13,766
+thì chị ta thản nhiên trả lời
+
