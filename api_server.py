@@ -44,7 +44,10 @@ PROFILE_CATALOG_PATH = DATA_DIR / "profile_catalog.json"
 LEGACY_SAMPLE_DIR = ROOT_DIR / "voice"
 MODEL_ID = os.environ.get("OMNIVOICE_MODEL_ID", "k2-fsa/OmniVoice")
 TOKEN_PATH = DATA_DIR / "omnivoice_internal_token.txt"
-INTERNAL_TOKEN = os.environ.get("AUTO_YT_OMNIVOICE_TOKEN", "").strip()
+INTERNAL_TOKEN = (
+    os.environ.get("NEXUS_OMNIVOICE_TOKEN", "").strip()
+    or os.environ.get("AUTO_YT_OMNIVOICE_TOKEN", "").strip()
+)
 if not INTERNAL_TOKEN:
     if TOKEN_PATH.exists():
         try:
