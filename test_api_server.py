@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import soundfile as sf
 import torch
 
 import api_server
@@ -84,6 +85,83 @@ class OmniVoiceWorkerTests(unittest.TestCase):
         settings = api_server._normalize_new_job_settings({"denoise": True})
 
         self.assertFalse(settings["denoise"])
+
+    def test_poetry_prosody_is_opt_in_and_bounded(self):
+        standard = api_server._normalize_new_job_settings({})
+        poetry = api_server._normalize_new_job_settings(
+            {
+                "prosody_mode": api_server.VIETNAMESE_POETRY_PROSODY,
+                "poetry_line_pause_ms": 550,
+                "poetry_couplet_pause_ms": 1100,
+            }
+        )
+
+        self.assertNotIn("prosody_mode", standard)
+        self.assertEqual(poetry["prosody_mode"], api_server.VIETNAMESE_POETRY_PROSODY)
+        self.assertEqual(poetry["poetry_line_pause_ms"], 550)
+        self.assertEqual(poetry["poetry_couplet_pause_ms"], 1100)
+        with self.assertRaisesRegex(ValueError, "ngữ điệu"):
+            api_server._normalize_new_job_settings({"prosody_mode": "global_poetry"})
+
+    def test_seven_syllable_poetry_preserves_author_punctuation(self):
+        settings = api_server._normalize_new_job_settings(
+            {"prosody_mode": api_server.VIETNAMESE_POETRY_PROSODY}
+        )
+        chunks = api_server._split_vietnamese_poetry(
+            "TỨC CẢNH PÁC BÓ.\n\n"
+            "Sáng ra bờ suối, tối vào hang\n"
+            "Cháo bẹ, rau măng vẫn sẵn sàng\n"
+            "Bàn đá chông chênh dịch sử Đảng\n"
+            "Cuộc đời cách mạng thật là sang",
+            settings,
+        )
+
+        self.assertEqual(chunks[0]["role"], "title")
+        self.assertTrue(all(chunk["poem_form"] == "seven_syllable" for chunk in chunks))
+        self.assertEqual(chunks[1]["rhythm"], "4/3")
+        self.assertEqual(chunks[2]["rhythm"], "2/2/3")
+        self.assertIn("Cháo bẹ, rau măng, vẫn sẵn sàng", chunks[2]["text"])
+        self.assertEqual(chunks[1]["pause_after_ms"], 550)
+        self.assertEqual(chunks[2]["pause_after_ms"], 1100)
+        self.assertEqual(chunks[-1]["pause_after_ms"], 0)
+
+    def test_luc_bat_uses_line_and_couplet_pauses(self):
+        settings = api_server._normalize_new_job_settings(
+            {"prosody_mode": api_server.VIETNAMESE_POETRY_PROSODY}
+        )
+        chunks = api_server._split_vietnamese_poetry(
+            "Bắc Nam như cội với cành\n"
+            "anh em ruột thịt đấu tranh một lòng\n"
+            "rồi đây thống nhất thành công\n"
+            "Bắc Nam ta lại vui chung một nhà",
+            settings,
+        )
+
+        self.assertEqual(chunks[0]["poem_form"], "luc_bat")
+        self.assertEqual(chunks[0]["rhythm"], "2/2/2")
+        self.assertEqual(chunks[1]["rhythm"], "2/2/2/2")
+        self.assertEqual(chunks[0]["pause_after_ms"], 550)
+        self.assertEqual(chunks[1]["pause_after_ms"], 1100)
+
+    def test_merge_uses_per_chunk_poetry_pauses(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            job_dir = Path(temporary_directory)
+            sample_rate = 8_000
+            tone = np.ones(sample_rate, dtype=np.float32) * 0.05
+            sf.write(job_dir / "chunk-00000.wav", tone, sample_rate)
+            sf.write(job_dir / "chunk-00001.wav", tone, sample_rate)
+            manifest = {
+                "settings": {"pause_ms": 150},
+                "chunks": [
+                    {"file": "chunk-00000.wav", "text": "dòng một", "pause_after_ms": 700},
+                    {"file": "chunk-00001.wav", "text": "dòng hai", "pause_after_ms": 0},
+                ],
+            }
+
+            final_path = api_server._merge_chunks(job_dir, manifest)
+            info = sf.info(final_path)
+
+        self.assertAlmostEqual(info.duration, 2.7, places=2)
 
     def test_inference_prompt_preserves_reference_transcript(self):
         tokens = torch.ones((8, 20), dtype=torch.long)

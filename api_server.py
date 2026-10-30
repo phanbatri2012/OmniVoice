@@ -76,6 +76,7 @@ DEFAULT_MAX_CHUNK_CHARS = 220
 DEFAULT_TARGET_WORDS_PER_MINUTE = 145.0
 DEFAULT_MIN_WORDS_PER_MINUTE = 90.0
 DEFAULT_MAX_WORDS_PER_MINUTE = 320.0
+VIETNAMESE_POETRY_PROSODY = "vietnamese_poetry_v1"
 PROFILE_ID_PATTERN = re.compile(r"^[a-f0-9-]{36}$")
 SUPPORTED_SAMPLE_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg"}
 
@@ -240,6 +241,177 @@ def _split_text(text: str, max_chars: int = DEFAULT_MAX_CHUNK_CHARS) -> list[str
     return chunks
 
 
+def _poetry_words(line: str) -> list[str]:
+    return [token for token in re.findall(r"[^\W_]+(?:[-'][^\W_]+)*", line, re.UNICODE) if token]
+
+
+def _detect_poetry_form(syllable_counts: list[int]) -> str:
+    counts = [count for count in syllable_counts if count > 0]
+    if not counts:
+        return "free_verse"
+
+    def matches(pattern: tuple[int, ...], tolerance: int = 0) -> float:
+        return sum(
+            abs(count - pattern[index % len(pattern)]) <= tolerance
+            for index, count in enumerate(counts)
+        ) / len(counts)
+
+    if len(counts) >= 4 and matches((7, 7, 6, 8)) >= 0.8:
+        return "song_that_luc_bat"
+    if len(counts) >= 2 and matches((6, 8)) >= 0.8:
+        return "luc_bat"
+    for syllables, form in (
+        (4, "four_syllable"),
+        (5, "five_syllable"),
+        (7, "seven_syllable"),
+        (8, "eight_syllable"),
+    ):
+        if sum(count == syllables for count in counts) / len(counts) >= 0.75:
+            return form
+    return "free_verse"
+
+
+def _rhythm_boundaries(form: str, syllable_count: int, line_index: int) -> tuple[int, ...]:
+    if form == "luc_bat":
+        return (2, 4) if syllable_count == 6 else (2, 4, 6)
+    if form == "song_that_luc_bat":
+        pattern_index = line_index % 4
+        if pattern_index in {0, 1}:
+            return (3,)
+        return (2, 4) if pattern_index == 2 else (2, 4, 6)
+    if form == "four_syllable":
+        return (2,)
+    if form == "five_syllable":
+        return (2,)
+    if form == "seven_syllable":
+        return (4,)
+    if form == "eight_syllable":
+        return (4,)
+    return ()
+
+
+def _punctuate_poetry_line(
+    line: str,
+    *,
+    form: str,
+    line_index: int,
+    is_stanza_end: bool,
+) -> tuple[str, str, int]:
+    tokens = line.split()
+    syllable_count = len(_poetry_words(line))
+    boundaries = _rhythm_boundaries(form, syllable_count, line_index)
+    existing_boundaries = {
+        index
+        for index, token in enumerate(tokens[:-1], start=1)
+        if re.search(r"[,;:–—-]$", token)
+    }
+    for boundary in boundaries:
+        if boundary <= 0 or boundary >= len(tokens) or boundary in existing_boundaries:
+            continue
+        # Existing author punctuation takes precedence near the canonical beat.
+        if any(abs(boundary - existing) <= 1 for existing in existing_boundaries):
+            continue
+        if not re.search(r"[,;:!?….-]$", tokens[boundary - 1]):
+            tokens[boundary - 1] += ","
+
+    prepared = " ".join(tokens).strip()
+    if prepared and not re.search(r"[.!?…,;:]$", prepared):
+        if form == "luc_bat":
+            prepared += "," if line_index % 2 == 0 else "."
+        elif form == "song_that_luc_bat":
+            prepared += "." if line_index % 4 == 3 else ","
+        else:
+            prepared += "." if is_stanza_end else ","
+    actual_boundaries = tuple(
+        index
+        for index, token in enumerate(tokens[:-1], start=1)
+        if re.search(r"[,;:–—-]$", token)
+    )
+    rhythm = str(syllable_count)
+    if actual_boundaries:
+        positions = (0, *actual_boundaries, syllable_count)
+        rhythm = "/".join(str(positions[i + 1] - positions[i]) for i in range(len(positions) - 1))
+    return prepared, rhythm, syllable_count
+
+
+def _split_vietnamese_poetry(text: str, settings: dict) -> list[dict]:
+    normalized = re.sub(r"[ \t]+", " ", str(text or "")).strip()
+    if not normalized:
+        raise ValueError("Nội dung tạo audio không được để trống.")
+    if len(normalized) > MAX_TEXT_CHARS:
+        raise ValueError(f"Nội dung vượt quá {MAX_TEXT_CHARS:,} ký tự.")
+
+    raw_lines = normalized.splitlines()
+    nonempty_indexes = [index for index, line in enumerate(raw_lines) if line.strip()]
+    if not nonempty_indexes:
+        raise ValueError("Nội dung tạo audio không được để trống.")
+    title_index = None
+    first_index = nonempty_indexes[0]
+    if first_index + 1 < len(raw_lines) and not raw_lines[first_index + 1].strip():
+        title_index = first_index
+
+    poem_indexes = [index for index in nonempty_indexes if index != title_index]
+    counts = [len(_poetry_words(raw_lines[index])) for index in poem_indexes]
+    poem_form = _detect_poetry_form(counts)
+    line_positions = {raw_index: position for position, raw_index in enumerate(poem_indexes)}
+    chunks: list[dict] = []
+    for raw_index in nonempty_indexes:
+        line = raw_lines[raw_index].strip()
+        next_nonempty = next((idx for idx in nonempty_indexes if idx > raw_index), None)
+        is_stanza_end = next_nonempty is None or next_nonempty > raw_index + 1
+        if raw_index == title_index:
+            chunks.append(
+                {
+                    "text": line,
+                    "role": "title",
+                    "poem_form": poem_form,
+                    "syllable_count": len(_poetry_words(line)),
+                    "rhythm": "title",
+                    "pause_after_ms": int(settings["poetry_title_pause_ms"]),
+                }
+            )
+            continue
+
+        line_index = line_positions[raw_index]
+        prepared, rhythm, syllable_count = _punctuate_poetry_line(
+            line,
+            form=poem_form,
+            line_index=line_index,
+            is_stanza_end=is_stanza_end,
+        )
+        if poem_form == "luc_bat":
+            pause_ms = (
+                settings["poetry_line_pause_ms"]
+                if line_index % 2 == 0
+                else settings["poetry_couplet_pause_ms"]
+            )
+        elif poem_form == "song_that_luc_bat":
+            pause_ms = (
+                settings["poetry_line_pause_ms"]
+                if line_index % 4 in {0, 2}
+                else settings["poetry_couplet_pause_ms"]
+            )
+        elif poem_form == "seven_syllable" and line_index % 2 == 1:
+            pause_ms = settings["poetry_couplet_pause_ms"]
+        else:
+            pause_ms = settings["poetry_line_pause_ms"]
+        if is_stanza_end:
+            pause_ms = max(pause_ms, settings["poetry_stanza_pause_ms"])
+        chunks.append(
+            {
+                "text": prepared,
+                "role": "line",
+                "poem_form": poem_form,
+                "syllable_count": syllable_count,
+                "rhythm": rhythm,
+                "pause_after_ms": int(pause_ms),
+            }
+        )
+    if chunks:
+        chunks[-1]["pause_after_ms"] = 0
+    return chunks
+
+
 def _bounded_number(
     value: object,
     default: float,
@@ -279,7 +451,7 @@ def _normalize_new_job_settings(raw_settings: object) -> dict:
         maximum_wpm,
         "Tốc độ mục tiêu",
     )
-    return {
+    normalized = {
         "engine_revision": max(ENGINE_REVISION, int(settings.get("engine_revision") or ENGINE_REVISION)),
         "target_words_per_minute": target_wpm,
         "min_words_per_minute": minimum_wpm,
@@ -307,6 +479,44 @@ def _normalize_new_job_settings(raw_settings: object) -> dict:
             settings.get("audio_chunk_threshold", 24), 24, 10, 60, "Ngưỡng chunk nội bộ"
         ),
     }
+    prosody_mode = str(settings.get("prosody_mode") or "").strip().casefold()
+    if prosody_mode:
+        if prosody_mode != VIETNAMESE_POETRY_PROSODY:
+            raise ValueError("Chế độ ngữ điệu không được hỗ trợ.")
+        normalized.update(
+            {
+                "prosody_mode": prosody_mode,
+                "poetry_title_pause_ms": int(_bounded_number(
+                    settings.get("poetry_title_pause_ms", 1100),
+                    1100,
+                    0,
+                    2000,
+                    "Khoảng nghỉ sau tiêu đề",
+                )),
+                "poetry_line_pause_ms": int(_bounded_number(
+                    settings.get("poetry_line_pause_ms", 550),
+                    550,
+                    0,
+                    2000,
+                    "Khoảng nghỉ giữa dòng thơ",
+                )),
+                "poetry_couplet_pause_ms": int(_bounded_number(
+                    settings.get("poetry_couplet_pause_ms", 1100),
+                    1100,
+                    0,
+                    2000,
+                    "Khoảng nghỉ giữa cặp thơ",
+                )),
+                "poetry_stanza_pause_ms": int(_bounded_number(
+                    settings.get("poetry_stanza_pause_ms", 1350),
+                    1350,
+                    0,
+                    2000,
+                    "Khoảng nghỉ giữa khổ thơ",
+                )),
+            }
+        )
+    return normalized
 
 
 def _is_quality_managed(settings: object) -> bool:
@@ -481,6 +691,7 @@ def _merge_chunks(job_dir: Path, manifest: dict) -> Path:
     pause_ms = max(0, min(int(manifest.get("settings", {}).get("pause_ms", 250)), 2000))
     audio_parts: list[np.ndarray] = []
     sample_rate: int | None = None
+    inserted_pause_seconds = 0.0
     for index, path in enumerate(chunk_paths):
         audio, current_rate = sf.read(str(path), dtype="float32", always_2d=False)
         if audio.size == 0:
@@ -502,19 +713,28 @@ def _merge_chunks(job_dir: Path, manifest: dict) -> Path:
             audio[-fade_samples:] *= fade_out
             
         audio_parts.append(audio)
-        if pause_ms and index < len(chunk_paths) - 1:
-            audio_parts.append(np.zeros(int(sample_rate * pause_ms / 1000), dtype=np.float32))
+        chunk_pause_ms = max(
+            0,
+            min(
+                int(manifest["chunks"][index].get("pause_after_ms", pause_ms)),
+                2000,
+            ),
+        )
+        if chunk_pause_ms and index < len(chunk_paths) - 1:
+            audio_parts.append(
+                np.zeros(int(sample_rate * chunk_pause_ms / 1000), dtype=np.float32)
+            )
+            inserted_pause_seconds += chunk_pause_ms / 1000.0
     final_path = job_dir / "final.wav"
     merged_audio = np.concatenate(audio_parts)
     if _is_quality_managed(manifest.get("settings")):
-        pause_seconds = pause_ms * max(0, len(chunk_paths) - 1) / 1000.0
         chunk_cushion = max(2.0, len(chunk_paths) * 0.25)
         _validate_generated_audio(
             merged_audio,
             int(sample_rate),
             " ".join(chunk["text"] for chunk in manifest["chunks"]),
             manifest["settings"],
-            extra_allowance_seconds=4.0 + pause_seconds + chunk_cushion,
+            extra_allowance_seconds=4.0 + inserted_pause_seconds + chunk_cushion,
         )
     sf.write(str(final_path), merged_audio, sample_rate, subtype="PCM_16")
     _wav_duration(final_path)
@@ -936,10 +1156,16 @@ def create_job(request: TTSJobRequest) -> dict:
         merged_settings = {**voice_settings, **(request.settings or {})}
         
         settings = _normalize_new_job_settings(merged_settings)
-        chunks = _split_text(
-            request.text,
-            max_chars=int(settings["max_chunk_chars"]),
-        )
+        if settings.get("prosody_mode") == VIETNAMESE_POETRY_PROSODY:
+            chunk_specs = _split_vietnamese_poetry(request.text, settings)
+        else:
+            chunk_specs = [
+                {"text": text}
+                for text in _split_text(
+                    request.text,
+                    max_chars=int(settings["max_chunk_chars"]),
+                )
+            ]
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not profile_path.exists():
@@ -967,13 +1193,15 @@ def create_job(request: TTSJobRequest) -> dict:
         "text_hash": hashlib.sha256(request.text.encode("utf-8")).hexdigest(),
         "chunks": [
             {
+                **chunk_spec,
                 "index": index,
-                "text": text,
-                "text_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "text_hash": hashlib.sha256(
+                    chunk_spec["text"].encode("utf-8")
+                ).hexdigest(),
                 "file": f"chunk-{index:05d}.wav",
                 "status": "pending",
             }
-            for index, text in enumerate(chunks)
+            for index, chunk_spec in enumerate(chunk_specs)
         ],
         "completed_chunks": 0,
         "cancel_requested": False,
