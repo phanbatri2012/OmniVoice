@@ -93,6 +93,15 @@ class OmniVoiceWorkerTests(unittest.TestCase):
                 "prosody_mode": api_server.VIETNAMESE_POETRY_PROSODY,
                 "poetry_line_pause_ms": 550,
                 "poetry_couplet_pause_ms": 1100,
+                "poetry_emphasis_strength": 1.65,
+                "poetry_title_mode": "natural_rhythm",
+                "poetry_generation_grouping": "couplet",
+                "poetry_mastering_mode": "custom",
+                "poetry_dynamic_emphasis_db": 1.8,
+                "poetry_line_end_emphasis_db": 2.2,
+                "poetry_target_active_rms_dbfs": -14.5,
+                "poetry_reverb_mix": 0.12,
+                "poetry_reverb_decay_ms": 700,
             }
         )
 
@@ -100,6 +109,15 @@ class OmniVoiceWorkerTests(unittest.TestCase):
         self.assertEqual(poetry["prosody_mode"], api_server.VIETNAMESE_POETRY_PROSODY)
         self.assertEqual(poetry["poetry_line_pause_ms"], 550)
         self.assertEqual(poetry["poetry_couplet_pause_ms"], 1100)
+        self.assertEqual(poetry["poetry_emphasis_strength"], 1.65)
+        self.assertEqual(poetry["poetry_title_mode"], "natural_rhythm")
+        self.assertEqual(poetry["poetry_generation_grouping"], "couplet")
+        self.assertEqual(poetry["poetry_mastering_mode"], "custom")
+        self.assertEqual(poetry["poetry_dynamic_emphasis_db"], 1.8)
+        self.assertEqual(poetry["poetry_line_end_emphasis_db"], 2.2)
+        self.assertEqual(poetry["poetry_target_active_rms_dbfs"], -14.5)
+        self.assertEqual(poetry["poetry_reverb_mix"], 0.12)
+        self.assertEqual(poetry["poetry_reverb_decay_ms"], 700)
         with self.assertRaisesRegex(ValueError, "ngữ điệu"):
             api_server._normalize_new_job_settings({"prosody_mode": "global_poetry"})
 
@@ -124,6 +142,64 @@ class OmniVoiceWorkerTests(unittest.TestCase):
         self.assertEqual(chunks[1]["pause_after_ms"], 550)
         self.assertEqual(chunks[2]["pause_after_ms"], 1100)
         self.assertEqual(chunks[-1]["pause_after_ms"], 0)
+
+    def test_strong_poetry_emphasis_uses_deeper_beats_and_lingering_endings(self):
+        settings = api_server._normalize_new_job_settings(
+            {
+                "prosody_mode": api_server.VIETNAMESE_POETRY_PROSODY,
+                "poetry_emphasis_strength": 1.65,
+            }
+        )
+        chunks = api_server._split_vietnamese_poetry(
+            "TỨC CẢNH PÁC BÓ.\n\n"
+            "Sáng ra bờ suối, tối vào hang,\n"
+            "Cháo bẹ rau măng vẫn sẵn sàng.",
+            settings,
+        )
+
+        self.assertEqual(chunks[0]["text"], "TỨC CẢNH PÁC BÓ.")
+        self.assertIn(";", chunks[2]["text"])
+        self.assertTrue(all(chunk["text"].endswith("…") for chunk in chunks[1:]))
+
+    def test_poetry_title_natural_rhythm_normalizes_uppercase_and_adds_beat(self):
+        settings = api_server._normalize_new_job_settings(
+            {
+                "prosody_mode": api_server.VIETNAMESE_POETRY_PROSODY,
+                "poetry_title_mode": "natural_rhythm",
+            }
+        )
+        chunks = api_server._split_vietnamese_poetry(
+            "TỨC CẢNH PÁC BÓ.\n\nSáng ra bờ suối, tối vào hang.",
+            settings,
+        )
+
+        self.assertEqual(chunks[0]["text"], "Tức Cảnh — Pác Bó.")
+        self.assertEqual(chunks[0]["role"], "title")
+
+    def test_poetry_couplet_grouping_preserves_natural_line_endings(self):
+        settings = api_server._normalize_new_job_settings(
+            {
+                "prosody_mode": api_server.VIETNAMESE_POETRY_PROSODY,
+                "poetry_generation_grouping": "couplet",
+                "poetry_emphasis_strength": 1.35,
+                "poetry_couplet_pause_ms": 1700,
+            }
+        )
+        chunks = api_server._split_vietnamese_poetry(
+            "TỨC CẢNH PÁC BÓ.\n\n"
+            "Sáng ra bờ suối, tối vào hang,\n"
+            "Cháo bẹ, rau măng vẫn sẵn sàng.\n"
+            "Bàn đá chông chênh dịch sử Đảng,\n"
+            "Cuộc đời cách mạng thật là sang.",
+            settings,
+        )
+
+        self.assertEqual([chunk["role"] for chunk in chunks], ["title", "couplet", "couplet"])
+        self.assertEqual(chunks[1]["line_count"], 2)
+        self.assertEqual(chunks[1]["pause_after_ms"], 1700)
+        self.assertIn("hang,\n", chunks[1]["text"])
+        self.assertTrue(chunks[1]["text"].endswith("sàng."))
+        self.assertNotIn("…", chunks[1]["text"])
 
     def test_luc_bat_uses_line_and_couplet_pauses(self):
         settings = api_server._normalize_new_job_settings(
@@ -162,6 +238,85 @@ class OmniVoiceWorkerTests(unittest.TestCase):
             info = sf.info(final_path)
 
         self.assertAlmostEqual(info.duration, 2.7, places=2)
+
+    def test_peak_headroom_prevents_pcm_clipping_without_compression(self):
+        hot = np.array([-1.2, -0.4, 0.2, 1.0], dtype=np.float32)
+        quiet = np.array([-0.5, 0.25], dtype=np.float32)
+
+        normalized_hot = api_server._apply_peak_headroom(hot)
+        normalized_quiet = api_server._apply_peak_headroom(quiet)
+
+        self.assertAlmostEqual(float(np.max(np.abs(normalized_hot))), 0.98, places=5)
+        np.testing.assert_allclose(normalized_quiet, quiet)
+        self.assertAlmostEqual(
+            float(normalized_hot[1] / normalized_hot[0]),
+            float(hot[1] / hot[0]),
+            places=5,
+        )
+
+    def test_custom_poetry_mastering_adds_reverb_tail_and_loudness(self):
+        sample_rate = 8_000
+        time_axis = np.arange(sample_rate, dtype=np.float32) / sample_rate
+        tone = (0.03 * np.sin(2 * np.pi * 180 * time_axis)).astype(np.float32)
+        settings = {
+            "poetry_mastering_mode": "custom",
+            "poetry_target_active_rms_dbfs": -14.5,
+            "poetry_reverb_mix": 0.12,
+            "poetry_reverb_decay_ms": 500,
+        }
+
+        mastered = api_server._apply_poetry_mastering(tone, sample_rate, settings)
+
+        self.assertGreater(len(mastered), len(tone))
+        self.assertGreater(
+            api_server._active_rms(mastered, sample_rate),
+            api_server._active_rms(tone, sample_rate),
+        )
+        self.assertLessEqual(float(np.max(np.abs(mastered))), 0.981)
+
+    def test_poetry_line_dynamics_follow_rhythm_only_when_enabled(self):
+        audio = np.ones(800, dtype=np.float32) * 0.1
+        settings = {
+            "poetry_mastering_mode": "custom",
+            "poetry_dynamic_emphasis_db": 1.8,
+        }
+
+        emphasized = api_server._apply_poetry_line_dynamics(
+            audio,
+            {"role": "line", "rhythm": "4/3"},
+            settings,
+        )
+        title = api_server._apply_poetry_line_dynamics(
+            audio,
+            {"role": "title", "rhythm": "title"},
+            settings,
+        )
+
+        self.assertGreater(float(np.max(emphasized)), 0.1)
+        self.assertGreater(float(np.std(emphasized)), 0.0)
+        np.testing.assert_allclose(title, audio)
+
+    def test_poetry_line_end_emphasis_only_lifts_end_phrase(self):
+        audio = np.ones(1_000, dtype=np.float32) * 0.1
+        settings = {
+            "poetry_mastering_mode": "custom",
+            "poetry_line_end_emphasis_db": 2.2,
+        }
+
+        emphasized = api_server._apply_poetry_line_dynamics(
+            audio,
+            {"role": "line", "rhythm": "4/3"},
+            settings,
+        )
+        title = api_server._apply_poetry_line_dynamics(
+            audio,
+            {"role": "title", "rhythm": "title"},
+            settings,
+        )
+
+        np.testing.assert_allclose(emphasized[:620], audio[:620])
+        self.assertGreater(float(np.max(emphasized[620:])), 0.1)
+        np.testing.assert_allclose(title, audio)
 
     def test_inference_prompt_preserves_reference_transcript(self):
         tokens = torch.ones((8, 20), dtype=torch.long)

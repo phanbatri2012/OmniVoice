@@ -11,6 +11,7 @@ import secrets
 import shutil
 import threading
 import time
+import unicodedata
 import uuid
 import wave
 from contextlib import asynccontextmanager
@@ -21,6 +22,7 @@ import numpy as np
 import soundfile as sf
 import torch
 import librosa
+from scipy.signal import lfilter
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -296,6 +298,7 @@ def _punctuate_poetry_line(
     form: str,
     line_index: int,
     is_stanza_end: bool,
+    emphasis_strength: float = 1.0,
 ) -> tuple[str, str, int]:
     tokens = line.split()
     syllable_count = len(_poetry_words(line))
@@ -312,7 +315,7 @@ def _punctuate_poetry_line(
         if any(abs(boundary - existing) <= 1 for existing in existing_boundaries):
             continue
         if not re.search(r"[,;:!?….-]$", tokens[boundary - 1]):
-            tokens[boundary - 1] += ","
+            tokens[boundary - 1] += ";" if emphasis_strength >= 1.35 else ","
 
     prepared = " ".join(tokens).strip()
     if prepared and not re.search(r"[.!?…,;:]$", prepared):
@@ -322,6 +325,8 @@ def _punctuate_poetry_line(
             prepared += "." if line_index % 4 == 3 else ","
         else:
             prepared += "." if is_stanza_end else ","
+    if prepared and emphasis_strength >= 1.6:
+        prepared = re.sub(r"[,.;:!?…]+$", "…", prepared)
     actual_boundaries = tuple(
         index
         for index, token in enumerate(tokens[:-1], start=1)
@@ -332,6 +337,69 @@ def _punctuate_poetry_line(
         positions = (0, *actual_boundaries, syllable_count)
         rhythm = "/".join(str(positions[i + 1] - positions[i]) for i in range(len(positions) - 1))
     return prepared, rhythm, syllable_count
+
+
+def _prepare_poetry_title(line: str, settings: dict) -> str:
+    prepared = unicodedata.normalize("NFC", str(line or "")).strip()
+    prepared = re.sub(r"[ \t]+", " ", prepared)
+    if settings.get("poetry_title_mode") != "natural_rhythm":
+        return prepared
+
+    cased_characters = [character for character in prepared if character.isalpha()]
+    if cased_characters and all(character.isupper() for character in cased_characters):
+        prepared = prepared.title()
+
+    tokens = prepared.split()
+    if 4 <= len(tokens) <= 8 and not any(
+        re.search(r"[,;:–—-]$", token) for token in tokens[:-1]
+    ):
+        boundary = {4: 2, 5: 2, 6: 3, 7: 4, 8: 4}[len(tokens)]
+        tokens.insert(boundary, "—")
+        prepared = " ".join(tokens)
+    return prepared
+
+
+def _group_poetry_generation_chunks(chunks: list[dict], grouping: str) -> list[dict]:
+    if grouping != "couplet":
+        return chunks
+
+    grouped: list[dict] = []
+    pending_lines: list[dict] = []
+
+    def flush_pending() -> None:
+        if not pending_lines:
+            return
+        if len(pending_lines) == 1:
+            grouped.append(pending_lines[0])
+        else:
+            last_line = pending_lines[-1]
+            grouped.append(
+                {
+                    "text": "\n".join(line["text"] for line in pending_lines),
+                    "role": "couplet",
+                    "poem_form": last_line["poem_form"],
+                    "syllable_count": sum(
+                        int(line["syllable_count"]) for line in pending_lines
+                    ),
+                    "rhythm": " + ".join(line["rhythm"] for line in pending_lines),
+                    "line_count": len(pending_lines),
+                    "line_rhythms": [line["rhythm"] for line in pending_lines],
+                    "pause_after_ms": int(last_line["pause_after_ms"]),
+                    "_stanza_end": bool(last_line.get("_stanza_end")),
+                }
+            )
+        pending_lines.clear()
+
+    for chunk in chunks:
+        if chunk.get("role") != "line":
+            flush_pending()
+            grouped.append(chunk)
+            continue
+        pending_lines.append(chunk)
+        if len(pending_lines) == 2 or bool(chunk.get("_stanza_end")):
+            flush_pending()
+    flush_pending()
+    return grouped
 
 
 def _split_vietnamese_poetry(text: str, settings: dict) -> list[dict]:
@@ -360,12 +428,13 @@ def _split_vietnamese_poetry(text: str, settings: dict) -> list[dict]:
         next_nonempty = next((idx for idx in nonempty_indexes if idx > raw_index), None)
         is_stanza_end = next_nonempty is None or next_nonempty > raw_index + 1
         if raw_index == title_index:
+            prepared_title = _prepare_poetry_title(line, settings)
             chunks.append(
                 {
-                    "text": line,
+                    "text": prepared_title,
                     "role": "title",
                     "poem_form": poem_form,
-                    "syllable_count": len(_poetry_words(line)),
+                    "syllable_count": len(_poetry_words(prepared_title)),
                     "rhythm": "title",
                     "pause_after_ms": int(settings["poetry_title_pause_ms"]),
                 }
@@ -378,6 +447,7 @@ def _split_vietnamese_poetry(text: str, settings: dict) -> list[dict]:
             form=poem_form,
             line_index=line_index,
             is_stanza_end=is_stanza_end,
+            emphasis_strength=float(settings["poetry_emphasis_strength"]),
         )
         if poem_form == "luc_bat":
             pause_ms = (
@@ -405,10 +475,17 @@ def _split_vietnamese_poetry(text: str, settings: dict) -> list[dict]:
                 "syllable_count": syllable_count,
                 "rhythm": rhythm,
                 "pause_after_ms": int(pause_ms),
+                "_stanza_end": bool(is_stanza_end),
             }
         )
     if chunks:
         chunks[-1]["pause_after_ms"] = 0
+    chunks = _group_poetry_generation_chunks(
+        chunks,
+        str(settings.get("poetry_generation_grouping") or "line"),
+    )
+    for chunk in chunks:
+        chunk.pop("_stanza_end", None)
     return chunks
 
 
@@ -511,16 +588,218 @@ def _normalize_new_job_settings(raw_settings: object) -> dict:
                     settings.get("poetry_stanza_pause_ms", 1350),
                     1350,
                     0,
-                    2000,
+                    3000,
                     "Khoảng nghỉ giữa khổ thơ",
+                )),
+                "poetry_emphasis_strength": _bounded_number(
+                    settings.get("poetry_emphasis_strength", 1.0),
+                    1.0,
+                    1.0,
+                    2.0,
+                    "Mức nhấn nhá thơ",
+                ),
+                "poetry_title_mode": str(
+                    settings.get("poetry_title_mode") or "verbatim"
+                ).strip().casefold(),
+                "poetry_generation_grouping": str(
+                    settings.get("poetry_generation_grouping") or "line"
+                ).strip().casefold(),
+                "poetry_mastering_mode": str(
+                    settings.get("poetry_mastering_mode") or "none"
+                ).strip().casefold(),
+                "poetry_dynamic_emphasis_db": _bounded_number(
+                    settings.get("poetry_dynamic_emphasis_db", 0.0),
+                    0.0,
+                    0.0,
+                    3.0,
+                    "Mức nhấn động thơ",
+                ),
+                "poetry_line_end_emphasis_db": _bounded_number(
+                    settings.get("poetry_line_end_emphasis_db", 0.0),
+                    0.0,
+                    0.0,
+                    3.0,
+                    "Mức nhấn cuối câu thơ",
+                ),
+                "poetry_target_active_rms_dbfs": _bounded_number(
+                    settings.get("poetry_target_active_rms_dbfs", -16.0),
+                    -16.0,
+                    -24.0,
+                    -12.0,
+                    "Âm lượng RMS mục tiêu",
+                ),
+                "poetry_reverb_mix": _bounded_number(
+                    settings.get("poetry_reverb_mix", 0.0),
+                    0.0,
+                    0.0,
+                    0.3,
+                    "Tỷ lệ tiếng vang",
+                ),
+                "poetry_reverb_decay_ms": int(_bounded_number(
+                    settings.get("poetry_reverb_decay_ms", 650),
+                    650,
+                    250,
+                    1200,
+                    "Độ ngân tiếng vang",
                 )),
             }
         )
+        if normalized["poetry_title_mode"] not in {"verbatim", "natural_rhythm"}:
+            raise ValueError("Chế độ đọc tiêu đề thơ không được hỗ trợ.")
+        if normalized["poetry_generation_grouping"] not in {"line", "couplet"}:
+            raise ValueError("Cách nhóm dòng thơ không được hỗ trợ.")
+        if normalized["poetry_mastering_mode"] not in {"none", "custom"}:
+            raise ValueError("Chế độ mastering thơ không được hỗ trợ.")
     return normalized
 
 
 def _is_quality_managed(settings: object) -> bool:
     return isinstance(settings, dict) and int(settings.get("engine_revision") or 1) >= ENGINE_REVISION
+
+
+def _apply_peak_headroom(audio: np.ndarray, ceiling: float = 0.98) -> np.ndarray:
+    prepared = np.asarray(audio, dtype=np.float32)
+    if prepared.size == 0:
+        return prepared
+    peak = float(np.max(np.abs(prepared)))
+    if not np.isfinite(peak):
+        raise RuntimeError("Audio chứa giá trị không hợp lệ.")
+    if peak > ceiling:
+        prepared = prepared * (ceiling / peak)
+    return prepared.astype(np.float32, copy=False)
+
+
+def _apply_poetry_line_dynamics(
+    audio: np.ndarray,
+    chunk: dict,
+    settings: dict,
+) -> np.ndarray:
+    emphasis_db = float(settings.get("poetry_dynamic_emphasis_db") or 0.0)
+    line_end_emphasis_db = float(
+        settings.get("poetry_line_end_emphasis_db") or 0.0
+    )
+    if (
+        settings.get("poetry_mastering_mode") != "custom"
+        or chunk.get("role") != "line"
+        or (emphasis_db <= 0.0 and line_end_emphasis_db <= 0.0)
+        or len(audio) < 2
+    ):
+        return audio
+
+    rhythm = str(chunk.get("rhythm") or "")
+    try:
+        groups = [int(value) for value in rhythm.split("/") if int(value) > 0]
+    except ValueError:
+        groups = []
+    if not groups:
+        groups = [1]
+
+    envelope_db = np.zeros(len(audio), dtype=np.float32)
+    if emphasis_db > 0.0:
+        total_units = sum(groups)
+        unit_start = 0
+        for group in groups:
+            start = int(round(len(audio) * unit_start / total_units))
+            unit_start += group
+            end = int(round(len(audio) * unit_start / total_units))
+            if end <= start:
+                continue
+            phase = np.linspace(
+                0.0,
+                1.0,
+                end - start,
+                endpoint=False,
+                dtype=np.float32,
+            )
+            envelope_db[start:end] = emphasis_db * np.sin(np.pi * phase) ** 2
+
+    if line_end_emphasis_db > 0.0:
+        end_phrase_start = int(round(len(audio) * 0.62))
+        end_phase = np.linspace(
+            0.0,
+            1.0,
+            len(audio) - end_phrase_start,
+            endpoint=True,
+            dtype=np.float32,
+        )
+        envelope_db[end_phrase_start:] += (
+            line_end_emphasis_db * np.sin(np.pi * end_phase) ** 2
+        )
+    envelope = np.power(10.0, envelope_db / 20.0).astype(np.float32)
+    return np.asarray(audio, dtype=np.float32) * envelope
+
+
+def _active_rms(audio: np.ndarray, sample_rate: int) -> float:
+    frame_samples = max(1, int(sample_rate * 0.02))
+    usable = len(audio) - len(audio) % frame_samples
+    if usable <= 0:
+        return float(np.sqrt(np.mean(np.square(audio)) + 1e-12))
+    frames = np.asarray(audio[:usable], dtype=np.float32).reshape(-1, frame_samples)
+    frame_rms = np.sqrt(np.mean(np.square(frames), axis=1) + 1e-12)
+    active = frame_rms[frame_rms > 10 ** (-45.0 / 20.0)]
+    if not len(active):
+        return float(np.sqrt(np.mean(np.square(audio)) + 1e-12))
+    return float(np.sqrt(np.mean(np.square(active))))
+
+
+def _apply_poetry_reverb(
+    audio: np.ndarray,
+    sample_rate: int,
+    mix: float,
+    decay_ms: int,
+) -> np.ndarray:
+    if mix <= 0.0:
+        return audio
+    tail_samples = int(sample_rate * decay_ms / 1000)
+    dry = np.pad(np.asarray(audio, dtype=np.float32), (0, tail_samples))
+    decay_seconds = decay_ms / 1000.0
+    wet = np.zeros_like(dry)
+    for delay_ms in (29.7, 37.1, 41.1, 43.7):
+        delay_samples = max(1, int(sample_rate * delay_ms / 1000))
+        feedback = 10 ** (-3.0 * (delay_ms / 1000.0) / decay_seconds)
+        denominator = np.zeros(delay_samples + 1, dtype=np.float32)
+        denominator[0] = 1.0
+        denominator[-1] = -feedback
+        wet += lfilter([1.0], denominator, dry).astype(np.float32) - dry
+    wet /= 4.0
+    wet = lfilter([0.18], [1.0, -0.82], wet).astype(np.float32)
+    dry_rms = _active_rms(dry, sample_rate)
+    wet_rms = _active_rms(wet, sample_rate)
+    if wet_rms > 1e-8:
+        wet *= dry_rms / wet_rms
+    return dry * (1.0 - mix) + wet * mix
+
+
+def _apply_poetry_mastering(
+    audio: np.ndarray,
+    sample_rate: int,
+    settings: dict,
+) -> np.ndarray:
+    if settings.get("poetry_mastering_mode") != "custom":
+        return _apply_peak_headroom(audio)
+
+    mastered = _apply_poetry_reverb(
+        audio,
+        sample_rate,
+        float(settings.get("poetry_reverb_mix") or 0.0),
+        int(settings.get("poetry_reverb_decay_ms") or 650),
+    )
+    target_dbfs = float(settings.get("poetry_target_active_rms_dbfs") or -16.0)
+    current_rms = max(_active_rms(mastered, sample_rate), 1e-8)
+    gain_db = max(-3.0, min(6.0, target_dbfs - 20.0 * np.log10(current_rms)))
+    mastered = mastered * (10.0 ** (gain_db / 20.0))
+
+    threshold = 0.86
+    ceiling = 0.98
+    magnitude = np.abs(mastered)
+    limited = np.array(mastered, dtype=np.float32, copy=True)
+    over = magnitude > threshold
+    limited[over] = np.sign(mastered[over]) * (
+        threshold
+        + (ceiling - threshold)
+        * np.tanh((magnitude[over] - threshold) / (ceiling - threshold))
+    )
+    return _apply_peak_headroom(limited, ceiling=ceiling)
 
 
 def _build_inference_voice_prompt(profile: VoiceClonePrompt) -> VoiceClonePrompt:
@@ -688,7 +967,8 @@ def _merge_chunks(job_dir: Path, manifest: dict) -> Path:
     chunk_paths = [job_dir / chunk["file"] for chunk in manifest["chunks"]]
     if not chunk_paths or any(not path.exists() for path in chunk_paths):
         raise RuntimeError("Chưa tạo đủ chunk audio để ghép.")
-    pause_ms = max(0, min(int(manifest.get("settings", {}).get("pause_ms", 250)), 2000))
+    settings = manifest.get("settings", {})
+    pause_ms = max(0, min(int(settings.get("pause_ms", 250)), 2000))
     audio_parts: list[np.ndarray] = []
     sample_rate: int | None = None
     inserted_pause_seconds = 0.0
@@ -702,7 +982,13 @@ def _merge_chunks(job_dir: Path, manifest: dict) -> Path:
             sample_rate = int(current_rate)
         if int(current_rate) != sample_rate:
             raise RuntimeError("Các chunk audio có sample rate không đồng nhất.")
-            
+
+        audio = _apply_poetry_line_dynamics(
+            audio,
+            manifest["chunks"][index],
+            settings,
+        )
+
         # Thêm fade in/out 10ms để khử tiếng 'bụp' khi ghép (pop/click noise)
         fade_samples = int(sample_rate * 0.01) # 10ms
         audio_length = len(audio)
@@ -726,7 +1012,11 @@ def _merge_chunks(job_dir: Path, manifest: dict) -> Path:
             )
             inserted_pause_seconds += chunk_pause_ms / 1000.0
     final_path = job_dir / "final.wav"
-    merged_audio = np.concatenate(audio_parts)
+    merged_audio = _apply_poetry_mastering(
+        np.concatenate(audio_parts),
+        int(sample_rate),
+        settings,
+    )
     if _is_quality_managed(manifest.get("settings")):
         chunk_cushion = max(2.0, len(chunk_paths) * 0.25)
         _validate_generated_audio(
@@ -819,6 +1109,7 @@ def _process_job(job_id: str) -> None:
             audio, _ = librosa.effects.trim(raw_audio, top_db=40)
             if audio.size == 0:
                 audio = raw_audio # Fallback if completely trimmed
+            audio = _apply_peak_headroom(audio)
 
             chunk_duration = (
                 _validate_generated_audio(

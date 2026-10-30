@@ -22,3 +22,7 @@ When working with OmniVoice generation (both in Python scripts and `api_server.p
 4. **Audio Chunk Merging (Pop/Click Prevention)**:
    - When manually concatenating audio chunks or inserting silence using `numpy`, **always** apply a short crossfade or envelope (e.g., a 10ms fade-in/fade-out using `np.linspace(0.0, 1.0, fade_samples)`).
    - Directly appending `np.zeros()` to raw model output without fading the boundaries to 0.0 creates abrupt amplitude jumps, causing audible "pop" or "click" artifacts between sentences.
+
+5. **Anti-Infinite Loops & Bounded Generation**:
+   - Every audio chunking, model inference loop, batch synthesis, or polling routine must have hard iteration bounds (`max_iterations`, `max_retries`) and explicit per-chunk timeouts.
+   - Never write unbounded `while True` loops when waiting for model generation, audio streaming, or process termination; fail closed with clear error logging if processing exceeds deadlines.
